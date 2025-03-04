@@ -22,32 +22,7 @@ export default function RootLayout({ children }) {
 	return (
 		<html lang="en">
 			<body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
-				<header className="header">
-					<nav className="nav">
-						<Link href="/" className="nav-link">
-							Omni Speed Reader
-						</Link>
-					</nav>
-				</header>
 				{children}
-				<footer className="footer">
-					<p>&copy; 2025 Omni Speed Reader. All rights reserved.</p>
-				</footer>
-				<style>{`
-					.header {
-						background: #f2f2f2;
-						padding: 1rem;
-					}
-					.nav {
-						display: flex;
-						gap: 1rem;
-					}
-					.footer {
-						text-align: center;
-						padding: 1rem;
-						background: #f2f2f2;
-					}
-				`}</style>
 			</body>
 		</html>
 	);

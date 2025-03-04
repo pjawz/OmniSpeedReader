@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import styles from "./SpeedReader.module.css";
 
-// Utility functions extracted to reduce component complexity
+// Utility functions
 const formatTimeWithPadding = (minutes, seconds) => {
 	const secondsStr = seconds < 10 ? `0${seconds}` : `${seconds}`;
 	return `${minutes}:${secondsStr}`;
@@ -15,49 +15,132 @@ const calculateTimeFromWords = (wordCount, wpm) => {
 	return { minutes, seconds };
 };
 
-// Function to highlight the optimal reading position (ORP) of a word
-// This helps readers focus on the right spot for better reading efficiency
-const processWordForDisplay = (word) => {
-	if (!word || word.length <= 1) return { before: "", optimal: word, after: "" };
+// Function to split text into natural phrase chunks
+const splitIntoPhrasesNatural = (text, maxWordsPerPhrase = 3) => {
+	if (!text) return [];
 
-	// For words with 1-4 characters, highlight the first character
-	if (word.length <= 4) {
-		return {
-			before: "",
-			optimal: word[0],
-			after: word.slice(1),
-		};
+	// Split text into sentences
+	const sentences = text.split(/(?<=[.!?])\s+/);
+	const phrases = [];
+
+	sentences.forEach((sentence) => {
+		// Split sentence into words
+		const words = sentence.split(/\s+/).filter((word) => word.length > 0);
+
+		// Group words into phrases (based on punctuation and length)
+		let currentPhrase = [];
+		let currentLength = 0;
+
+		words.forEach((word, index) => {
+			// Add word to current phrase
+			currentPhrase.push(word);
+			currentLength++;
+
+			// Conditions to complete a phrase:
+			// 1. Reached max words per phrase
+			// 2. Encountered punctuation that would make a natural break
+			// 3. Last word in sentence
+			const hasPunctuation = /[,;:]$/.test(word);
+			const isLastWord = index === words.length - 1;
+
+			if (currentLength >= maxWordsPerPhrase || hasPunctuation || isLastWord) {
+				phrases.push(currentPhrase.join(" "));
+				currentPhrase = [];
+				currentLength = 0;
+			}
+		});
+
+		// Add any remaining words as a phrase
+		if (currentPhrase.length > 0) {
+			phrases.push(currentPhrase.join(" "));
+		}
+	});
+
+	return phrases;
+};
+
+// Function to estimate optimal phrase reading time based on complexity
+const calculatePhraseTime = (phrase, baseWpm) => {
+	// Factors affecting reading time:
+	// 1. Phrase length (word count)
+	// 2. Word complexity (character count)
+	// 3. Presence of punctuation
+
+	const words = phrase.split(/\s+/);
+	const wordCount = words.length;
+
+	// Calculate average word length in the phrase
+	const avgWordLength = phrase.replace(/\s+/g, "").length / wordCount;
+
+	// Check for punctuation that might require a pause
+	const hasPunctuation = /[,;.!?:]/.test(phrase);
+
+	// Base time in milliseconds for the phrase
+	let baseTimeMs = (wordCount / baseWpm) * 60 * 1000;
+
+	// Adjust time based on complexity factors
+	// Longer words take more time to process
+	if (avgWordLength > 6) {
+		baseTimeMs *= 1.2;
 	}
 
-	// For longer words, find the optimal reading position (about 30% into the word)
-	const orpIndex = Math.max(1, Math.min(Math.floor(word.length * 0.3), word.length - 2));
+	// Add a slight pause for phrases with punctuation
+	if (hasPunctuation) {
+		baseTimeMs *= 1.3;
+	}
+
+	return baseTimeMs;
+};
+
+// Function to create a smart highlight for the current phrase
+const processPhrase = (phrase) => {
+	if (!phrase) return { before: "", highlight: "", after: "" };
+
+	const words = phrase.split(/\s+/);
+
+	// For very short phrases, highlight the whole phrase
+	if (words.length <= 1) {
+		return { before: "", highlight: phrase, after: "" };
+	}
+
+	// For longer phrases, highlight a key portion (typically the second word or middle)
+	const highlightIndex = Math.min(1, Math.floor(words.length / 2));
 
 	return {
-		before: word.slice(0, orpIndex),
-		optimal: word[orpIndex],
-		after: word.slice(orpIndex + 1),
+		before: words.slice(0, highlightIndex).join(" "),
+		highlight: words[highlightIndex],
+		after: words.slice(highlightIndex + 1).join(" "),
 	};
 };
 
 const SpeedReader = () => {
 	// State declarations
 	const [text, setText] = useState("");
-	const [words, setWords] = useState([]);
+	const [phrases, setPhrases] = useState([]);
+	const [phrasesHistory, setPhrasesHistory] = useState([]); // Store recently viewed phrases
 	const [currentIndex, setCurrentIndex] = useState(-1);
+	const [currentPosition, setCurrentPosition] = useState({ word: 0, phrase: 0 }); // Track word position for analytics
 	const [isPlaying, setIsPlaying] = useState(false);
 	const [wpm, setWpm] = useState(300);
 	const [estimatedTime, setEstimatedTime] = useState({ minutes: 0, seconds: 0 });
 	const [fontSizeLevel, setFontSizeLevel] = useState(2); // 0=small, 1=medium, 2=large
 	const [darkMode, setDarkMode] = useState(true);
-	const [focusMode, setFocusMode] = useState(false); // New state for focus mode
-	const [saveModalOpen, setSaveModalOpen] = useState(false); // For save/load functionality
-	const [savedTexts, setSavedTexts] = useState([]); // Store saved texts in local storage
-	const [textTitle, setTextTitle] = useState(""); // Title for saving texts
-	const timerIdRef = useRef(null);
-	const textAreaRef = useRef(null); // Reference to textarea for focus
-	const displayAreaRef = useRef(null); // Reference to display area for focus mode
+	const [focusMode, setFocusMode] = useState(false);
+	const [saveModalOpen, setSaveModalOpen] = useState(false);
+	const [savedTexts, setSavedTexts] = useState([]);
+	const [textTitle, setTextTitle] = useState("");
+	const [wordsPerPhrase, setWordsPerPhrase] = useState(3); // Default words per phrase
+	const [smartTiming, setSmartTiming] = useState(true); // Adaptive timing based on phrase complexity
+	const [showPhrasesHistory, setShowPhrasesHistory] = useState(false); // Toggle for history view
+	const [comprehensionMode, setComprehensionMode] = useState(false); // Optimized for comprehension
 
-	// Load saved texts from local storage on initial mount
+	// References
+	const timerIdRef = useRef(null);
+	const textAreaRef = useRef(null);
+	const displayAreaRef = useRef(null);
+	const historyRef = useRef(null);
+
+	// Load saved texts and user preferences from local storage
 	useEffect(() => {
 		const savedItems = localStorage.getItem("omniReaderSavedTexts");
 		if (savedItems) {
@@ -77,6 +160,16 @@ const SpeedReader = () => {
 
 		const savedFontSize = localStorage.getItem("omniReaderFontSize");
 		if (savedFontSize !== null) setFontSizeLevel(Number(savedFontSize));
+
+		const savedWordsPerPhrase = localStorage.getItem("omniReaderWordsPerPhrase");
+		if (savedWordsPerPhrase !== null) setWordsPerPhrase(Number(savedWordsPerPhrase));
+
+		const savedSmartTiming = localStorage.getItem("omniReaderSmartTiming");
+		if (savedSmartTiming !== null) setSmartTiming(savedSmartTiming === "true");
+
+		const savedComprehensionMode = localStorage.getItem("omniReaderComprehensionMode");
+		if (savedComprehensionMode !== null)
+			setComprehensionMode(savedComprehensionMode === "true");
 	}, []);
 
 	// Save user preferences when they change
@@ -84,19 +177,41 @@ const SpeedReader = () => {
 		localStorage.setItem("omniReaderWpm", wpm);
 		localStorage.setItem("omniReaderDarkMode", darkMode);
 		localStorage.setItem("omniReaderFontSize", fontSizeLevel);
-	}, [wpm, darkMode, fontSizeLevel]);
+		localStorage.setItem("omniReaderWordsPerPhrase", wordsPerPhrase);
+		localStorage.setItem("omniReaderSmartTiming", smartTiming);
+		localStorage.setItem("omniReaderComprehensionMode", comprehensionMode);
+	}, [wpm, darkMode, fontSizeLevel, wordsPerPhrase, smartTiming, comprehensionMode]);
 
 	// Handle text input changes
 	const handleTextChange = (e) => {
 		const newText = e.target.value;
 		setText(newText);
-		const newWords = newText.split(/\s+/).filter((word) => word.length > 0);
-		setWords(newWords);
+
+		// Process text into phrases
+		const newPhrases = splitIntoPhrasesNatural(newText, wordsPerPhrase);
+		setPhrases(newPhrases);
 		setCurrentIndex(-1);
 		setIsPlaying(false);
+		setPhrasesHistory([]);
+		setCurrentPosition({ word: 0, phrase: 0 });
 
-		// Calculate estimated reading time when text changes
-		calculateEstimatedTime(newWords.length, wpm);
+		// Calculate estimated reading time
+		const wordCount = newText.split(/\s+/).filter((word) => word.length > 0).length;
+		calculateEstimatedTime(wordCount, wpm);
+	};
+
+	// Handle words per phrase change
+	const handleWordsPerPhraseChange = (value) => {
+		const newWordsPerPhrase = Math.max(1, Math.min(6, value));
+		setWordsPerPhrase(newWordsPerPhrase);
+
+		// Re-process text into phrases with new setting
+		if (text) {
+			const newPhrases = splitIntoPhrasesNatural(text, newWordsPerPhrase);
+			setPhrases(newPhrases);
+			setCurrentIndex(-1);
+			setIsPlaying(false);
+		}
 	};
 
 	// Calculate estimated reading time based on word count and WPM
@@ -109,13 +224,13 @@ const SpeedReader = () => {
 	const togglePlayPause = () => {
 		if (isPlaying) {
 			setIsPlaying(false);
-		} else if (words.length > 0) {
-			if (currentIndex === -1 || currentIndex >= words.length) setCurrentIndex(0);
+		} else if (phrases.length > 0) {
+			if (currentIndex === -1 || currentIndex >= phrases.length) setCurrentIndex(0);
 			setIsPlaying(true);
 		}
 	};
 
-	// Keyboard shortcuts for common actions
+	// Keyboard shortcuts for controlling the reader
 	useEffect(() => {
 		const handleKeyDown = (e) => {
 			// Skip if focused on text input
@@ -126,13 +241,13 @@ const SpeedReader = () => {
 					e.preventDefault();
 					togglePlayPause();
 					break;
-				case "ArrowLeft": // Previous word
+				case "ArrowLeft": // Previous phrase
 					e.preventDefault();
-					navigateWords(-1);
+					navigatePhrases(-1);
 					break;
-				case "ArrowRight": // Next word
+				case "ArrowRight": // Next phrase
 					e.preventDefault();
-					navigateWords(1);
+					navigatePhrases(1);
 					break;
 				case "ArrowUp": // Increase speed
 					e.preventDefault();
@@ -146,24 +261,42 @@ const SpeedReader = () => {
 					e.preventDefault();
 					toggleFocusMode();
 					break;
-				case "Escape": // Exit focus mode
+				case "KeyH": // Toggle history view
+					e.preventDefault();
+					setShowPhrasesHistory((prev) => !prev);
+					break;
+				case "KeyC": // Toggle comprehension mode
+					e.preventDefault();
+					setComprehensionMode((prev) => !prev);
+					break;
+				case "Escape": // Exit focus mode or close history
 					if (focusMode) {
 						e.preventDefault();
 						setFocusMode(false);
+					} else if (showPhrasesHistory) {
+						e.preventDefault();
+						setShowPhrasesHistory(false);
 					}
+					break;
+				case "Backspace": // Quick rewind 5 phrases
+					e.preventDefault();
+					navigatePhrases(-5);
 					break;
 			}
 		};
 
 		window.addEventListener("keydown", handleKeyDown);
 		return () => window.removeEventListener("keydown", handleKeyDown);
-	}, [isPlaying, words.length, currentIndex, wpm, focusMode]);
+	}, [isPlaying, phrases.length, currentIndex, wpm, focusMode, showPhrasesHistory]);
 
 	// Adjust reading speed
 	const handleWpmChange = (e) => {
 		const newWpm = Number(e.target.value);
 		setWpm(newWpm);
-		calculateEstimatedTime(words.length, newWpm);
+
+		// Recalculate estimated time
+		const wordCount = text.split(/\s+/).filter((word) => word.length > 0).length;
+		calculateEstimatedTime(wordCount, newWpm);
 	};
 
 	// Speed control with buttons
@@ -171,18 +304,46 @@ const SpeedReader = () => {
 		setWpm((prevWpm) => {
 			const newWpm = prevWpm + amount;
 			const adjustedWpm = Math.min(Math.max(newWpm, 100), 1500);
-			calculateEstimatedTime(words.length, adjustedWpm);
+
+			// Recalculate estimated time
+			const wordCount = text.split(/\s+/).filter((word) => word.length > 0).length;
+			calculateEstimatedTime(wordCount, adjustedWpm);
+
 			return adjustedWpm;
 		});
 	};
 
-	// Navigate through words
-	const navigateWords = (direction) => {
-		if (words.length === 0) return;
+	// Navigate through phrases
+	const navigatePhrases = (direction) => {
+		if (phrases.length === 0) return;
 
 		setCurrentIndex((prev) => {
 			const newIndex = prev + direction;
-			return Math.max(0, Math.min(newIndex, words.length - 1));
+			const boundedIndex = Math.max(0, Math.min(newIndex, phrases.length - 1));
+
+			// Update phrases history for rewind/review
+			if (boundedIndex >= 0 && boundedIndex < phrases.length) {
+				// Only add to history when moving forward
+				if (direction > 0 && prev >= 0) {
+					setPhrasesHistory((prevHistory) => {
+						// Keep only the last 20 phrases in history
+						const newHistory = [...prevHistory, phrases[prev]];
+						if (newHistory.length > 20) {
+							return newHistory.slice(newHistory.length - 20);
+						}
+						return newHistory;
+					});
+				}
+
+				// Update current position statistics
+				const phraseWordCount = phrases[boundedIndex].split(/\s+/).length;
+				setCurrentPosition((prevPosition) => ({
+					word: prevPosition.word + (direction > 0 ? phraseWordCount : -phraseWordCount),
+					phrase: boundedIndex,
+				}));
+			}
+
+			return boundedIndex;
 		});
 
 		if (isPlaying && direction < 0) {
@@ -195,12 +356,21 @@ const SpeedReader = () => {
 	const resetToStart = () => {
 		setCurrentIndex(0);
 		setIsPlaying(false);
+		setCurrentPosition({ word: 0, phrase: 0 });
+		setPhrasesHistory([]);
 	};
 
 	// Jump to end
 	const jumpToEnd = () => {
-		setCurrentIndex(words.length - 1);
+		setCurrentIndex(phrases.length - 1);
 		setIsPlaying(false);
+
+		// Update position to end
+		const totalWords = text.split(/\s+/).filter((word) => word.length > 0).length;
+		setCurrentPosition({
+			word: totalWords,
+			phrase: phrases.length - 1,
+		});
 	};
 
 	// Adjust font size
@@ -216,12 +386,31 @@ const SpeedReader = () => {
 	// Toggle focus mode - hides all UI except the reader
 	const toggleFocusMode = () => {
 		setFocusMode((prev) => !prev);
+		setShowPhrasesHistory(false); // Close history view when entering focus mode
 
 		// If entering focus mode, ensure reader is visible
 		if (!focusMode && displayAreaRef.current) {
 			setTimeout(() => {
 				displayAreaRef.current.scrollIntoView({ behavior: "smooth" });
 			}, 100);
+		}
+	};
+
+	// Toggle smart timing
+	const toggleSmartTiming = () => {
+		setSmartTiming((prev) => !prev);
+	};
+
+	// Toggle comprehension mode
+	const toggleComprehensionMode = () => {
+		setComprehensionMode((prev) => !prev);
+
+		// Adjust settings for comprehension mode
+		if (!comprehensionMode) {
+			// Slower speed for better comprehension
+			setWpm((prev) => Math.min(prev, 350));
+			// Slightly shorter phrases
+			setWordsPerPhrase(Math.min(wordsPerPhrase, 3));
 		}
 	};
 
@@ -247,11 +436,17 @@ const SpeedReader = () => {
 	// Load a saved text
 	const loadSavedText = (savedText) => {
 		setText(savedText.content);
-		const newWords = savedText.content.split(/\s+/).filter((word) => word.length > 0);
-		setWords(newWords);
+		const newPhrases = splitIntoPhrasesNatural(savedText.content, wordsPerPhrase);
+		setPhrases(newPhrases);
 		setCurrentIndex(-1);
 		setIsPlaying(false);
-		calculateEstimatedTime(newWords.length, wpm);
+		setPhrasesHistory([]);
+		setCurrentPosition({ word: 0, phrase: 0 });
+
+		// Calculate estimated time
+		const wordCount = savedText.content.split(/\s+/).filter((word) => word.length > 0).length;
+		calculateEstimatedTime(wordCount, wpm);
+
 		setSaveModalOpen(false);
 	};
 
@@ -262,58 +457,87 @@ const SpeedReader = () => {
 		localStorage.setItem("omniReaderSavedTexts", JSON.stringify(updatedSavedTexts));
 	};
 
-	// Manage word display timing
+	// Manage phrase display timing
 	useEffect(() => {
-		if (isPlaying && currentIndex < words.length) {
-			const interval = 60000 / wpm;
+		if (isPlaying && currentIndex < phrases.length) {
+			// Clear any existing timer
+			if (timerIdRef.current) {
+				clearTimeout(timerIdRef.current);
+			}
+
+			// Calculate time to display current phrase
+			let interval;
+
+			if (smartTiming) {
+				// Calculate adaptive timing based on phrase complexity
+				interval = calculatePhraseTime(phrases[currentIndex], wpm);
+			} else {
+				// Use standard timing based on WPM and word count
+				const wordCount = phrases[currentIndex].split(/\s+/).length;
+				interval = (wordCount / wpm) * 60 * 1000;
+			}
+
+			// Add additional pause for comprehension mode
+			if (comprehensionMode) {
+				interval *= 1.2;
+			}
+
+			// Set timer for next phrase
 			timerIdRef.current = setTimeout(() => {
-				setCurrentIndex((prev) => prev + 1);
+				// Move to next phrase
+				navigatePhrases(1);
 			}, interval);
-		} else if (currentIndex >= words.length && isPlaying) {
+		} else if (currentIndex >= phrases.length && isPlaying) {
 			setIsPlaying(false);
 		}
+
 		return () => clearTimeout(timerIdRef.current);
-	}, [isPlaying, currentIndex, wpm, words]);
+	}, [isPlaying, currentIndex, wpm, phrases, smartTiming, comprehensionMode]);
 
 	// Calculate estimated time on initial load and when dependencies change
 	useEffect(() => {
-		calculateEstimatedTime(words.length, wpm);
-	}, [words.length, wpm]);
+		if (text) {
+			const wordCount = text.split(/\s+/).filter((word) => word.length > 0).length;
+			calculateEstimatedTime(wordCount, wpm);
+		}
+	}, [text, wpm]);
 
-	// Determine text to display
-	let displayText = "Ready";
-	let processedWord = { before: "", optimal: "R", after: "eady" };
+	// Process current phrase for display
+	let displayPhrase = "Ready";
+	let processedPhrase = { before: "", highlight: "Ready", after: "" };
 
-	if (currentIndex >= 0 && currentIndex < words.length) {
-		displayText = words[currentIndex];
-		processedWord = processWordForDisplay(displayText);
-	} else if (currentIndex >= words.length) {
-		processedWord = { before: "End ", optimal: "o", after: "f text" };
+	if (currentIndex >= 0 && currentIndex < phrases.length) {
+		displayPhrase = phrases[currentIndex];
+		processedPhrase = processPhrase(displayPhrase);
+	} else if (currentIndex >= phrases.length) {
+		processedPhrase = { before: "End of", highlight: "text", after: "" };
 	}
 
 	// Calculate progress text
 	let progressText = "0/0";
-	if (words.length > 0) {
+	if (phrases.length > 0) {
 		const displayIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
-		progressText = `${displayIndex}/${words.length}`;
+		progressText = `${displayIndex}/${phrases.length}`;
 	}
 
 	// Format the estimated time for display
 	const formattedTime =
-		words.length > 0
+		text.length > 0
 			? formatTimeWithPadding(estimatedTime.minutes, estimatedTime.seconds)
 			: "0:00";
 
 	// Progress percentage calculation
 	const progressPercentage =
-		words.length > 0 && currentIndex >= 0
-			? Math.min((currentIndex / words.length) * 100, 100)
+		phrases.length > 0 && currentIndex >= 0
+			? Math.min((currentIndex / phrases.length) * 100, 100)
 			: 0;
 
 	// Calculate time remaining
 	let formattedRemainingTime = formattedTime;
-	if (words.length > 0 && currentIndex >= 0) {
-		const remainingWords = words.length - Math.max(0, currentIndex);
+	if (phrases.length > 0 && currentIndex >= 0) {
+		// Count words in remaining phrases
+		const remainingWords =
+			text.split(/\s+/).filter((word) => word.length > 0).length - currentPosition.word;
 		const { minutes, seconds } = calculateTimeFromWords(remainingWords, wpm);
 		formattedRemainingTime = formatTimeWithPadding(minutes, seconds);
 	}
@@ -327,257 +551,461 @@ const SpeedReader = () => {
 	// Focus mode class
 	const focusModeClass = focusMode ? styles.focusMode : "";
 
+	// Comprehension mode class
+	const comprehensionModeClass = comprehensionMode ? styles.comprehensionMode : "";
+
+	// History class
+	const historyClass = showPhrasesHistory ? styles.historyVisible : "";
+
 	return (
-		<div className={`${styles.speedReader} ${themeClass} ${focusModeClass}`}>
+		<div
+			className={`${styles.speedReader} ${themeClass} ${focusModeClass} ${comprehensionModeClass}`}
+		>
 			<h2 className={styles.title}>Omni Speed Reader</h2>
 
-			{/* Display Area with click-to-pause functionality */}
-			<div className={styles.displayContainer} ref={displayAreaRef}>
-				<div className={styles.displayArea} onClick={togglePlayPause}>
-					<div className={styles.focusLine}></div>
-					<div className={`${styles.word} ${fontSizeClass}`}>
-						<span className={styles.wordBefore}>{processedWord.before}</span>
-						<span className={styles.wordOptimal}>{processedWord.optimal}</span>
-						<span className={styles.wordAfter}>{processedWord.after}</span>
-					</div>
+			<div className={styles.twoColumnLayout}>
+				{/* Left Column - Compact Control Panel */}
+				<div className={styles.controlPanel}>
+					{/* Consolidated Controls in Grid Layout */}
+					<div className={styles.controlGrid}>
+						{/* Main Reading Controls */}
+						<div className={styles.gridSection}>oti
+							<div className={styles.mainControls}>
+								<button
+									className={`${styles.mainButton} ${styles.backButton}`}
+									onClick={() => navigatePhrases(-1)}
+									aria-label="Previous phrase"
+									data-tooltip="Previous phrase"
+								>
+									<span className={styles.buttonIcon}>◀</span>
+								</button>
 
-					{focusMode && (
-						<button
-							className={styles.exitFocusButton}
-							onClick={(e) => {
-								e.stopPropagation();
-								setFocusMode(false);
-							}}
-							aria-label="Exit focus mode"
-						>
-							<span className={styles.exitIcon}>✕</span>
-						</button>
-					)}
-				</div>
-				<div className={styles.progressBarContainer}>
-					<div className={styles.progressBar}>
-						<div
-							className={styles.progressFill}
-							style={{ width: `${progressPercentage}%` }}
-						></div>
-					</div>
-					<div className={styles.progressStats}>
-						<div className={styles.statItem}>
-							<span className={styles.statLabel}>Progress</span>
-							<span className={styles.statValue}>{progressText}</span>
+								<button
+									onClick={togglePlayPause}
+									className={`${styles.mainButton} ${styles.playPauseButton} ${
+										isPlaying ? styles.pauseButton : ""
+									}`}
+									data-tooltip={isPlaying ? "Pause reading" : "Start reading"}
+								>
+									<span className={styles.buttonIcon}>
+										{isPlaying ? "⏸" : "▶"}
+									</span>
+								</button>
+
+								<button
+									className={`${styles.mainButton} ${styles.forwardButton}`}
+									onClick={() => navigatePhrases(1)}
+									aria-label="Next phrase"
+									data-tooltip="Next phrase"
+								>
+									<span className={styles.buttonIcon}>▶</span>
+								</button>
+							</div>
+
+							<div className={styles.secondaryControls}>
+								<button
+									className={styles.controlButton}
+									onClick={resetToStart}
+									aria-label="Reset to beginning"
+									data-tooltip="Start from beginning"
+								>
+									<span className={styles.controlIcon}>⏮</span>
+								</button>
+								<button
+									className={styles.controlButton}
+									onClick={() => navigatePhrases(-5)}
+									aria-label="Back 5 phrases"
+									data-tooltip="Back 5 phrases"
+								>
+									<span className={styles.controlIcon}>⏪</span>
+								</button>
+								<button
+									className={styles.controlButton}
+									onClick={() => navigatePhrases(5)}
+									aria-label="Forward 5 phrases"
+									data-tooltip="Forward 5 phrases"
+								>
+									<span className={styles.controlIcon}>⏩</span>
+								</button>
+								<button
+									className={styles.controlButton}
+									onClick={jumpToEnd}
+									aria-label="Jump to end"
+									data-tooltip="Jump to end"
+								>
+									<span className={styles.controlIcon}>⏭</span>
+								</button>
+							</div>
 						</div>
-						<div className={styles.statItem}>
-							<span className={styles.statLabel}>Time</span>
-							<span className={styles.statValue}>
-								{currentIndex >= 0 ? formattedRemainingTime : formattedTime}
-								<span className={styles.timeLabel}>
-									{currentIndex >= 0 ? " remaining" : " total"}
-								</span>
-							</span>
+						{/* Reading Stats */}
+						{text.length > 0 && (
+							<div className={styles.gridSection}>
+								<div className={styles.sectionTitle}>
+									<span className={styles.sectionIcon}>📊</span>
+									<span>Stats</span>
+								</div>
+								<div className={styles.statsGrid}>
+									<div className={styles.statItem}>
+										<span className={styles.statValue}>
+											{
+												text.split(/\s+/).filter((word) => word.length > 0)
+													.length
+											}
+										</span>
+										<span className={styles.statLabel}>Words</span>
+									</div>
+									<div className={styles.statItem}>
+										<span className={styles.statValue}>{phrases.length}</span>
+										<span className={styles.statLabel}>Phrases</span>
+									</div>
+									<div className={styles.statItem}>
+										<span className={styles.statValue}>{progressText}</span>
+										<span className={styles.statLabel}>Progress</span>
+									</div>
+									<div className={styles.statItem}>
+										<span className={styles.statValue}>
+											{currentIndex >= 0
+												? formattedRemainingTime
+												: formattedTime}
+										</span>
+										<span className={styles.statLabel}>Time</span>
+									</div>
+								</div>
+							</div>
+						)}
+						{/* Speed Controls */}
+						<div className={styles.gridSection}>
+							<div className={styles.sectionTitle}>
+								<span className={styles.sectionIcon}>⚡</span>
+								<span>Speed</span>
+								<span className={styles.valueDisplay}>{wpm} wpm</span>
+							</div>
+							<div className={styles.speedSlider}>
+								<button
+									className={styles.speedButton}
+									onClick={() => adjustSpeed(-50)}
+									aria-label="Decrease speed"
+									data-tooltip="Slower (-50 wpm)"
+								>
+									−
+								</button>
+								<input
+									type="range"
+									min="100"
+									max="1000"
+									step="50"
+									value={wpm}
+									onChange={handleWpmChange}
+									className={styles.slider}
+									aria-label="Reading speed"
+								/>
+								<button
+									className={styles.speedButton}
+									onClick={() => adjustSpeed(50)}
+									aria-label="Increase speed"
+									data-tooltip="Faster (+50 wpm)"
+								>
+									+
+								</button>
+							</div>
+						</div>
+
+						{/* Phrase Length Controls */}
+						<div className={styles.gridSection}>
+							<div className={styles.sectionTitle}>
+								<span className={styles.sectionIcon}>📏</span>
+								<span>Phrase Length</span>
+							</div>
+							<div className={styles.phraseButtons}>
+								<button
+									className={`${styles.phraseLengthButton} ${
+										wordsPerPhrase === 1 ? styles.active : ""
+									}`}
+									onClick={() => handleWordsPerPhraseChange(1)}
+									aria-label="1 word per phrase"
+									data-tooltip="Single word mode"
+								>
+									1
+								</button>
+								<button
+									className={`${styles.phraseLengthButton} ${
+										wordsPerPhrase === 2 ? styles.active : ""
+									}`}
+									onClick={() => handleWordsPerPhraseChange(2)}
+									aria-label="2 words per phrase"
+									data-tooltip="2 words per phrase"
+								>
+									2
+								</button>
+								<button
+									className={`${styles.phraseLengthButton} ${
+										wordsPerPhrase === 3 ? styles.active : ""
+									}`}
+									onClick={() => handleWordsPerPhraseChange(3)}
+									aria-label="3 words per phrase"
+									data-tooltip="3 words per phrase"
+								>
+									3
+								</button>
+								<button
+									className={`${styles.phraseLengthButton} ${
+										wordsPerPhrase === 4 ? styles.active : ""
+									}`}
+									onClick={() => handleWordsPerPhraseChange(4)}
+									aria-label="4 words per phrase"
+									data-tooltip="4 words per phrase"
+								>
+									4
+								</button>
+								<button
+									className={`${styles.phraseLengthButton} ${
+										wordsPerPhrase === 5 ? styles.active : ""
+									}`}
+									onClick={() => handleWordsPerPhraseChange(5)}
+									aria-label="5+ words per phrase"
+									data-tooltip="5+ words per phrase"
+								>
+									5+
+								</button>
+							</div>
+						</div>
+
+						{/* Settings toggles as icon buttons */}
+						<div className={styles.gridSection}>
+							<div className={styles.sectionTitle}>
+								<span className={styles.sectionIcon}>⚙️</span>
+								<span>Settings</span>
+							</div>
+
+							<div className={styles.settingsGrid}>
+								<button
+									className={`${styles.settingButton} ${
+										showPhrasesHistory ? styles.active : ""
+									}`}
+									onClick={() => setShowPhrasesHistory((prev) => !prev)}
+									aria-label="Show phrase history"
+									data-tooltip="Recent phrases"
+								>
+									<span className={styles.settingIcon}>📜</span>
+								</button>
+								<button
+									className={`${styles.settingButton} ${
+										smartTiming ? styles.active : ""
+									}`}
+									onClick={toggleSmartTiming}
+									aria-label="Toggle smart timing"
+									data-tooltip="Smart timing"
+								>
+									<span className={styles.settingIcon}>⏱️</span>
+								</button>
+								<button
+									className={`${styles.settingButton} ${
+										comprehensionMode ? styles.active : ""
+									}`}
+									onClick={toggleComprehensionMode}
+									aria-label="Toggle comprehension mode"
+									data-tooltip="Comprehension mode"
+								>
+									<span className={styles.settingIcon}>🧠</span>
+								</button>
+								<button
+									className={`${styles.settingButton} ${
+										focusMode ? styles.active : ""
+									}`}
+									onClick={toggleFocusMode}
+									aria-label="Toggle focus mode"
+									data-tooltip="Focus mode"
+								>
+									<span className={styles.settingIcon}>👁️</span>
+								</button>
+								<button
+									className={styles.settingButton}
+									onClick={adjustFontSize}
+									aria-label="Change font size"
+									data-tooltip="Font size"
+								>
+									<span className={styles.settingIcon}>Aa</span>
+								</button>
+								<button
+									className={styles.settingButton}
+									onClick={toggleTheme}
+									aria-label="Toggle dark/light mode"
+									data-tooltip={darkMode ? "Light mode" : "Dark mode"}
+								>
+									<span className={styles.settingIcon}>
+										{darkMode ? "☀️" : "🌙"}
+									</span>
+								</button>
+								<button
+									className={styles.settingButton}
+									onClick={() => setSaveModalOpen(true)}
+									aria-label="Save/Load Text"
+									data-tooltip="Save/Load"
+								>
+									<span className={styles.settingIcon}>💾</span>
+								</button>
+								<button
+									className={styles.settingButton}
+									onClick={() =>
+										document
+											.getElementById("shortcutsModal")
+											.classList.toggle(styles.visible)
+									}
+									aria-label="Keyboard shortcuts"
+									data-tooltip="Shortcuts"
+								>
+									<span className={styles.settingIcon}>⌨️</span>
+								</button>
+							</div>
 						</div>
 					</div>
 				</div>
-			</div>
 
-			{/* Enhanced Controls Section */}
-			<div className={styles.controlsContainer}>
-				<div className={styles.controlsToolbar}>
-					{/* Navigation Controls */}
-					<div className={styles.controlGroup}>
-						<button
-							className={styles.controlButton}
-							onClick={resetToStart}
-							aria-label="Reset to beginning"
-							title="Reset to beginning (Home)"
-						>
-							<span className={styles.controlIcon}>⏮</span>
-						</button>
-						<button
-							className={styles.controlButton}
-							onClick={() => navigateWords(-10)}
-							aria-label="Back 10 words"
-							title="Back 10 words (Shift+Left)"
-						>
-							<span className={styles.controlIcon}>⏪</span>
-						</button>
-						<button
-							className={styles.controlButton}
-							onClick={() => navigateWords(-1)}
-							aria-label="Previous word"
-							title="Previous word (Left Arrow)"
-						>
-							<span className={styles.controlIcon}>◀</span>
-						</button>
-					</div>
-
-					{/* Play/Pause Control */}
-					<button
-						onClick={togglePlayPause}
-						className={`${styles.playButton} ${isPlaying ? styles.pauseButton : ""}`}
-						title="Play/Pause (Space)"
+				{/* Right Column - Reading Area */}
+				<div className={styles.readingPanel}>
+					{/* Display Area with click-to-pause functionality */}
+					<div
+						className={`${styles.displayContainer} ${historyClass}`}
+						ref={displayAreaRef}
 					>
-						{isPlaying ? "Pause" : "Play"}
-					</button>
+						<div className={styles.displayArea} onClick={togglePlayPause}>
+							<div className={styles.focusLine}></div>
+							<div className={`${styles.phrase} ${fontSizeClass}`}>
+								<span className={styles.phraseBefore}>
+									{processedPhrase.before}
+								</span>
+								{processedPhrase.before && " "}
+								<span className={styles.phraseHighlight}>
+									{processedPhrase.highlight}
+								</span>
+								{processedPhrase.after && " "}
+								<span className={styles.phraseAfter}>{processedPhrase.after}</span>
+							</div>
 
-					{/* Forward Navigation Controls */}
-					<div className={styles.controlGroup}>
-						<button
-							className={styles.controlButton}
-							onClick={() => navigateWords(1)}
-							aria-label="Next word"
-							title="Next word (Right Arrow)"
-						>
-							<span className={styles.controlIcon}>▶</span>
-						</button>
-						<button
-							className={styles.controlButton}
-							onClick={() => navigateWords(10)}
-							aria-label="Forward 10 words"
-							title="Forward 10 words (Shift+Right)"
-						>
-							<span className={styles.controlIcon}>⏩</span>
-						</button>
-						<button
-							className={styles.controlButton}
-							onClick={jumpToEnd}
-							aria-label="Jump to end"
-							title="Jump to end (End)"
-						>
-							<span className={styles.controlIcon}>⏭</span>
-						</button>
-					</div>
-				</div>
-
-				{/* Additional Controls and Stats Bar */}
-				<div className={styles.statsAndSettings}>
-					{/* Left: Speed Controls */}
-					<div className={styles.speedControls}>
-						<button
-							className={styles.speedButton}
-							onClick={() => adjustSpeed(-50)}
-							aria-label="Decrease speed"
-							title="Decrease speed (Down Arrow)"
-						>
-							−
-						</button>
-						<div className={styles.sliderContainer}>
-							<input
-								type="range"
-								min="100"
-								max="1500"
-								step="50"
-								value={wpm}
-								onChange={handleWpmChange}
-								className={styles.slider}
-								aria-label="Reading speed"
-							/>
-							<span className={styles.wpmLabel}>{wpm} wpm</span>
+							{focusMode && (
+								<button
+									className={styles.exitFocusButton}
+									onClick={(e) => {
+										e.stopPropagation();
+										setFocusMode(false);
+									}}
+									aria-label="Exit focus mode"
+								>
+									<span className={styles.exitIcon}>✕</span>
+								</button>
+							)}
 						</div>
-						<button
-							className={styles.speedButton}
-							onClick={() => adjustSpeed(50)}
-							aria-label="Increase speed"
-							title="Increase speed (Up Arrow)"
-						>
-							+
-						</button>
+
+						{/* Phrases History Panel */}
+						{showPhrasesHistory && (
+							<div className={styles.historyPanel} ref={historyRef}>
+								<div className={styles.historyHeader}>
+									<h3>Recently Read Phrases</h3>
+									<button
+										className={styles.closeHistoryButton}
+										onClick={() => setShowPhrasesHistory(false)}
+										aria-label="Close history"
+									>
+										✕
+									</button>
+								</div>
+								<div className={styles.historyContent}>
+									{phrasesHistory.length > 0 ? (
+										<ul className={styles.historyList}>
+											{phrasesHistory.map((phrase, index) => (
+												<li
+													key={index}
+													className={styles.historyItem}
+													onClick={() => {
+														// Find and go to this phrase in the original text
+														const phraseIndex = phrases.indexOf(phrase);
+														if (phraseIndex >= 0) {
+															setCurrentIndex(phraseIndex);
+															setIsPlaying(false);
+														}
+													}}
+												>
+													{phrase}
+												</li>
+											))}
+										</ul>
+									) : (
+										<p className={styles.noHistory}>
+											No phrases in history yet. Start reading to see recent
+											phrases here.
+										</p>
+									)}
+								</div>
+							</div>
+						)}
+
+						<div className={styles.progressBarContainer}>
+							<div className={styles.progressBar}>
+								<div
+									className={styles.progressFill}
+									style={{ width: `${progressPercentage}%` }}
+								></div>
+							</div>
+						</div>
 					</div>
 
-					{/* Right: Display settings */}
-					<div className={styles.displaySettings}>
-						<button
-							className={styles.settingButton}
-							onClick={toggleFocusMode}
-							aria-label="Toggle focus mode"
-							title="Toggle focus mode (F)"
-						>
-							<span className={styles.settingIcon}>👁️</span>
-						</button>
-						<button
-							className={styles.settingButton}
-							onClick={adjustFontSize}
-							aria-label="Change font size"
-							title="Change font size"
-						>
-							<span className={styles.settingIcon}>Aa</span>
-						</button>
-						<button
-							className={styles.settingButton}
-							onClick={toggleTheme}
-							aria-label="Toggle dark/light mode"
-							title="Toggle dark/light mode"
-						>
-							<span className={styles.settingIcon}>{darkMode ? "☀️" : "🌙"}</span>
-						</button>
-						<button
-							className={styles.settingButton}
-							onClick={() => setSaveModalOpen(true)}
-							aria-label="Save/Load Text"
-							title="Save or load text"
-						>
-							<span className={styles.settingIcon}>💾</span>
-						</button>
-					</div>
+					{/* Text Input Area */}
+					<textarea
+						ref={textAreaRef}
+						className={styles.textArea}
+						value={text}
+						onChange={handleTextChange}
+						placeholder="Enter your text here to speed read..."
+					/>
 				</div>
 			</div>
 
-			{/* Text Input Area */}
-			<textarea
-				ref={textAreaRef}
-				className={styles.textArea}
-				value={text}
-				onChange={handleTextChange}
-				placeholder="Enter your text here to speed read..."
-			/>
-
-			{/* Keyboard shortcuts help */}
-			<div className={styles.keyboardShortcuts}>
-				<button
-					className={styles.helpToggle}
-					onClick={() =>
-						document.getElementById("shortcutsModal").classList.toggle(styles.visible)
-					}
-					aria-label="Keyboard shortcuts"
-				>
-					⌨️ Keyboard Shortcuts
-				</button>
-				<div id="shortcutsModal" className={styles.shortcutsModal}>
-					<div className={styles.shortcutsContent}>
-						<h3>Keyboard Shortcuts</h3>
-						<div className={styles.shortcutGrid}>
-							<div className={styles.shortcutItem}>
-								<kbd>Space</kbd> Play/Pause
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>←</kbd> Previous word
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>→</kbd> Next word
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>↑</kbd> Increase speed
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>↓</kbd> Decrease speed
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>F</kbd> Toggle focus mode
-							</div>
-							<div className={styles.shortcutItem}>
-								<kbd>Esc</kbd> Exit focus mode
-							</div>
+			{/* Keyboard shortcuts help - moved modal outside layout */}
+			<div id="shortcutsModal" className={styles.shortcutsModal}>
+				<div className={styles.shortcutsContent}>
+					<h3>Keyboard Shortcuts</h3>
+					<div className={styles.shortcutGrid}>
+						<div className={styles.shortcutItem}>
+							<kbd>Space</kbd> Play/Pause
 						</div>
-						<button
-							className={styles.closeButton}
-							onClick={() =>
-								document
-									.getElementById("shortcutsModal")
-									.classList.remove(styles.visible)
-							}
-						>
-							Close
-						</button>
+						<div className={styles.shortcutItem}>
+							<kbd>←</kbd> Previous phrase
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>→</kbd> Next phrase
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>↑</kbd> Increase speed
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>↓</kbd> Decrease speed
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>Backspace</kbd> Rewind 5 phrases
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>F</kbd> Toggle focus mode
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>H</kbd> Toggle history view
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>C</kbd> Toggle comprehension mode
+						</div>
+						<div className={styles.shortcutItem}>
+							<kbd>Esc</kbd> Exit focus/history
+						</div>
 					</div>
+					<button
+						className={styles.closeButton}
+						onClick={() =>
+							document
+								.getElementById("shortcutsModal")
+								.classList.remove(styles.visible)
+						}
+					>
+						Close
+					</button>
 				</div>
 			</div>
 
